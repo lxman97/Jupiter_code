@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jupiter Allocation Processor</title>
+  <link href="https://fonts.googleapis.com/css?family=Material+Icons|Material+Icons+Outlined" rel="stylesheet">
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      background-color: #f4f4f4;
+    }
+    header {
+      background-color: #4CAF50;
+      color: white;
+      padding: 1rem;
+      text-align: center;
+    }
+    main {
+      padding: 1rem;
+    }
+    .upload-section {
+      background: white;
+      padding: 2rem;
+      border-radius: 5px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+      text-align: center;
+    }
+    .file-input {
+      display: none;
+    }
+    .upload-label {
+      display: inline-block;
+      padding: 0.5rem 1rem;
+      background-color: #4CAF50;
+      color: white;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+    .output-log {
+      margin-top: 1rem;
+      white-space: pre-wrap;
+      background: #eee;
+      padding: 1rem;
+      border-radius: 4px;
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Jupiter Allocation Processor</h1>
+  </header>
+  <main>
+    <section class="upload-section">
+      <input type="file" id="inputFile" class="file-input" accept=".xlsx, .xls" />
+      <label for="inputFile" class="upload-label">
+        <span class="material-icons-outlined">upload_file</span> Upload Excel File
+      </label>
+      <div id="log" class="output-log"></div>
+    </section>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script>
+    function formatDate(date) {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      const seconds = String(date.getSeconds()).padStart(2, '0');
+      return `${year}${month}${day}_${hours}${minutes}${seconds}`;
+    }
+
+    function parseDateFromCell(value) {
+      if (!value) return null;
+      if (typeof value === 'number') {
+        const dateParts = XLSX.SSF.parse_date_code(value);
+        if (!dateParts) return null;
+        return new Date(dateParts.y, dateParts.m - 1, dateParts.d, dateParts.H || 0, dateParts.M || 0, dateParts.S || 0);
+      }
+      if (typeof value === 'string') {
+        try {
+          const date = new Date(value);
+          if (!isNaN(date.getTime())) return date;
+        } catch (e) {
+          return null;
+        }
+      }
+      return null;
+    }
+
+    function getWorkingDays(start, end) {
+      let startCal = new Date(start);
+      let endCal = new Date(end);
+      let workDays = 0;
+      while (startCal <= endCal) {
+        const day = startCal.getDay();
+        if (day !== 0 && day !== 6) {
+          workDays++;
+        }
+        startCal.setDate(startCal.getDate() + 1);
+      }
+      return Math.max(workDays - 1, 0);
+    }
+
+    function getAgingLabel(days) {
+      if (days <= 1) return "0 - 1 day";
+      if (days <= 3) return "2 - 3 days";
+      if (days <= 5) return "4 - 5 days";
+      return "Above 5 days";
+    }
+
+    function normalizeDate(date) {
+      const cal = new Date(date);
+      cal.setHours(0, 0, 0, 0);
+      return cal;
+    }
+
+    async function processExcel(file) {
+      const logDiv = document.getElementById('log');
+      logDiv.textContent = 'Processing file...\n';
+
+      const desiredHeaders = [
+        "Country", "AP Ref #", "Input Source", "Current State", "Work Type",
+        "Exception Reason", "Document Type", "Currency", "Invoice No", "Supplier Name",
+        "Supplier Number", "PO Number", "Invoice: Created Date", "Current Owner",
+        "Previous State", "Comment History", "Company Code", "Current State Assign Date", "Invoice Due Date",
+        "Created date aging", "Created date aging AH", "Current State assigned date",
+        "Current state assigned date aging AH", "Overdue/Neardue", "Inflow Type",
+        "Total Amount", "Converted Invoice Total Amount", "AMT in MN", "Ownership", "Status"
+      ];
+
+      try {
+        // Read the uploaded file
+        const reader = new FileReader();
+        const fileData = await new Promise((resolve) => {
+          reader.onload = (e) => resolve(e.target.result);
+          reader.readAsBinaryString(file);
+        });
+
+        const workbook = XLSX.read(fileData, { type: 'binary' });
+        const inputSheet = workbook.Sheets[workbook.SheetNames[0]];
+
+        const headerRow = XLSX.utils.sheet_to_json(inputSheet, { header: 1 })[0];
+        const inputHeaderMap = {};
+        headerRow.forEach((header, index) => {
+          inputHeaderMap[header.trim()] = index;
+        });
+
+        const valuesSheet = workbook.Sheets['Values'];
+        const coraStatusToOwner = {};
+        if (valuesSheet) {
+          const valuesData = XLSX.utils.sheet_to_json(valuesSheet, { header: 1 });
+          const valHeaderRow = valuesData[0];
+          const valHeaderMap = {};
+          valHeaderRow.forEach((header, index) => {
+            valHeaderMap[header.trim()] = index;
+          });
+          const coraStatusCol = valHeaderMap['Cora Status'];
+          const ownerCol = valHeaderMap['Owner'];
+          if (coraStatusCol !== undefined && ownerCol !== undefined) {
+            for (let r = 1; r < valuesData.length; r++) {
+              const row = valuesData[r];
+              if (!row) continue;
+              const coraStatus = row[coraStatusCol]?.toString().trim();
+              const owner = row[ownerCol]?.toString().trim();
+              if (coraStatus && owner) {
+                coraStatusToOwner[coraStatus] = owner;
+              }
+            }
+          }
+        }
+
+        const outputSheetData = [desiredHeaders];
+        const inputData = XLSX.utils.sheet_to_json(inputSheet, { header: 1 }).slice(1);
+
+        inputData.forEach((inputRow) => {
+          if (!inputRow) return;
+          const outputRow = new Array(desiredHeaders.length).fill(null);
+
+          desiredHeaders.forEach((header, j) => {
+            const inputHeaderKey = header === "AP Ref #" ? "Invoice: AP Ref No" :
+                                  header === "PO Number" ? "OCR PO Number" : header;
+
+            const invoiceDate = parseDateFromCell(inputRow[inputHeaderMap["Invoice: Created Date"]]);
+            const assignDate = parseDateFromCell(inputRow[inputHeaderMap["Current State Assign Date"]]);
+
+            if (header === "Created date aging" && invoiceDate) {
+              const diffDays = Math.floor((new Date() - invoiceDate) / (1000 * 60 * 60 * 24));
+              outputRow[j] = diffDays;
+              return;
+            }
+            if (header === "Created date aging AH" && invoiceDate) {
+              const diffDays = Math.floor((new Date() - invoiceDate) / (1000 * 60 * 60 * 24));
+              outputRow[j] = getAgingLabel(diffDays);
+              return;
+            }
+            if (header === "Current State assigned date" && assignDate) {
+              outputRow[j] = getWorkingDays(assignDate, new Date());
+              return;
+            }
+            if (header === "Current state assigned date aging AH" && assignDate) {
+              const workingDays = getWorkingDays(assignDate, new Date());
+              outputRow[j] = getAgingLabel(workingDays);
+              return;
+            }
+            if (header === "Overdue/Neardue") {
+              const dueDate = parseDateFromCell(inputRow[inputHeaderMap["Invoice Due Date"]]);
+              if (!dueDate) {
+                outputRow[j] = "Due date not captured";
+              } else {
+                const today = normalizeDate(new Date());
+                const cal = new Date(today);
+                const day = cal.getDay();
+                const daysToFriday = 5 - day < 0 ? 5 - day + 7 : 5 - day;
+                cal.setDate(cal.getDate() + daysToFriday);
+                const thisFriday = normalizeDate(cal);
+                cal.setDate(cal.getDate() + 8);
+                const nextSaturday = normalizeDate(cal);
+                const normalizedDueDate = normalizeDate(dueDate);
+
+                if (normalizedDueDate <= thisFriday) {
+                  outputRow[j] = "Overdue";
+                } else if (normalizedDueDate <= nextSaturday) {
+                  outputRow[j] = "Neardue";
+                } else {
+                  outputRow[j] = "Future due";
+                }
+              }
+              return;
+            }
+            if (header === "AMT in MN") {
+              const amt = inputRow[inputHeaderMap["Converted Invoice Total Amount"]];
+              const value = typeof amt === 'number' ? amt : parseFloat(amt) || 0;
+              outputRow[j] = Math.round((value / 1000000.0) * 10000.0) / 10000.0;
+              return;
+            }
+            if (header === "Ownership") {
+              const currentState = inputRow[inputHeaderMap["Current State"]]?.toString().trim() || "";
+              outputRow[j] = coraStatusToOwner[currentState] || "";
+              return;
+            }
+            if (header === "Status") {
+              const currentState = inputRow[inputHeaderMap["Current State"]]?.toString().trim() || "";
+              const commentHistory = inputRow[inputHeaderMap["Comment History"]]?.toString().trim() || "";
+              const owner = coraStatusToOwner[currentState] || "";
+
+              if (commentHistory.includes("Payment feed received")) {
+                outputRow[j] = "Payment feed received but Mandatory field data missing - Need to close the workflow in CORA";
+              } else if (owner.toLowerCase() !== "genpact") {
+                outputRow[j] = "-";
+              } else if (["Awaiting Credit Note", "Pending For Supplier Credit Note", "Pending Response From Supplier"].includes(currentState)) {
+                outputRow[j] = "Awaiting credit note from the supplier";
+              } else {
+                outputRow[j] = "Ready for TL Validation";
+              }
+              return;
+            }
+            if (header === "Inflow Type") {
+              let inflowType = "";
+              const createdAging = invoiceDate ? Math.floor((new Date() - invoiceDate) / (1000 * 60 * 60 * 24)) : null;
+              const assignWorkingDays = assignDate ? getWorkingDays(assignDate, new Date()) : null;
+              if (createdAging !== null) {
+                if (createdAging <= 1) inflowType = "Fresh";
+                else if (createdAging > 1 && assignWorkingDays !== null) {
+                  inflowType = assignWorkingDays <= 1 ? "Comeback Fresh" : "Comeback Backlog";
+                }
+              }
+              outputRow[j] = inflowType;
+              return;
+            }
+
+            const colIndex = inputHeaderMap[inputHeaderKey];
+            if (colIndex !== undefined) {
+              outputRow[j] = inputRow[colIndex] ?? null;
+            }
+          });
+
+          outputSheetData.push(outputRow);
+        });
+
+        const outputWorkbook = XLSX.utils.book_new();
+        const outputSheet = XLSX.utils.aoa_to_sheet(outputSheetData);
+        XLSX.utils.book_append_sheet(outputWorkbook, outputSheet, "AllocationTracker");
+
+        // Generate downloadable file
+        const timestamp = formatDate(new Date());
+        const outputFileName = `Processed_File${timestamp}.xlsx`;
+        const wbout = XLSX.write(outputWorkbook, { bookType: 'xlsx', type: 'array' });
+        const blob = new Blob([wbout], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = outputFileName;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+
+        logDiv.textContent += `✅ Output file generated: ${outputFileName}\n`;
+      } catch (err) {
+        logDiv.textContent += `❌ Error: ${err.message}\n`;
+      }
+    }
+
+    document.getElementById('inputFile').addEventListener('change', (event) => {
+      const file = event.target.files[0];
+      if (file) {
+        processExcel(file);
+      }
+    });
+  </script>
+</body>
+</html>
